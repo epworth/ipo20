@@ -1,0 +1,114 @@
+name: Build and deploy Docker app to Azure
+on:
+  push:
+    branches:
+      - master
+
+env:
+  APPNAME: 2479
+  APPLICATIONPATH: Application
+  HOSTINGPLAN: 2479
+  DOCKERFILEPATH: "Application"
+  REGISTRYSKU: "Standard"
+  REGISTRYNAME: "2479acr"
+  REGISTRYLOCATION: "South Central US"
+  IMAGENAME: "24796629"
+  RESOURCEGROUPNAME: 2479-rg
+  LOCATION: West US 2
+  APPINSIGHTSLOCATION: West US 2
+  SUBSCRIPTIONID: 334c5f79-e98c-4b50-aa1a-5ed895892cfc
+  SKU: S1 Standard
+
+jobs:
+  build:
+    name: Build and push Application to ACR
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@master
+
+    - name: Azure authentication
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    # Create Azure container registry
+    - name: Create ACR
+      id: createACR
+      continue-on-error: false
+      run: |
+          az acr create -n ${{ env.REGISTRYNAME }} -g ${{ env.RESOURCEGROUPNAME }} --location "${{env.REGISTRYLOCATION}}" --sku ${{env.REGISTRYSKU}} --admin-enabled
+          echo "::set-output name=acr_username::`az acr credential show -n ${{ env.REGISTRYNAME }} --query username`"
+          echo "::set-output name=acr_password::`az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value`"
+          echo "::add-mask::`az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value`"
+
+    - name: ACR authentication
+      uses: azure/docker-login@v1
+      with:
+        login-server: ${{ env.REGISTRYNAME }}.azurecr.io
+        username: ${{ steps.createACR.outputs.acr_username }}
+        password: ${{ steps.createACR.outputs.acr_password }}
+
+    - name: Docker Build & Push to ACR
+      run: |
+        docker login ${{ env.REGISTRYNAME }}.azurecr.io --username ${{ steps.createACR.outputs.acr_username }} --password ${{ steps.createACR.outputs.acr_password }}
+        docker build "$GITHUB_WORKSPACE/${{env.DOCKERFILEPATH}}" -f  "${{env.DOCKERFILEPATH}}/Dockerfile" -t ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.sha }}
+        docker push ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.sha }}
+
+  deploy:
+    name: Deploy application to AKS
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@master
+
+    - name: Azure authentication
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - uses: azure/arm-deploy@v1
+      id: deploy
+      with:
+        subscriptionId: ${{ env.SUBSCRIPTIONID }}
+        resourceGroupName: ${{ env.RESOURCEGROUPNAME }}
+        template: ./ArmTemplates/container-webapp-template.json
+        parameters: webAppName="${{ env.APPNAME }}" hostingPlanName="${{ env.HOSTINGPLAN }}" sku="${{ env.SKU }}" appInsightsLocation="${{ env.APPINSIGHTSLOCATION }}" registryName="${{ env.REGISTRYNAME }}" imageName="${{ env.IMAGENAME }}" registryLocation="${{ env.REGISTRYLOCATION }}" registrySku="${{ env.REGISTRYSKU }}"
+ 
+    - name: Get ACR credentials
+      id: getACRCred
+      run: |
+           echo "::set-output name=acr_username::`az acr credential show -n ${{ env.REGISTRYNAME }} --query username | xargs`"
+           echo "::set-output name=acr_password::`az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value | xargs`"
+           echo "::add-mask::`az acr credential show -n ${{ env.REGISTRYNAME }} --query passwords[0].value | xargs`" 
+
+    - name: 'Deploy to Azure Web App for Container'
+      uses: azure/webapps-deploy@v2
+      with: 
+        app-name: ${{ env.APPNAME }} 
+        images: ${{ env.REGISTRYNAME }}.azurecr.io/${{ env.IMAGENAME }}:${{ github.sha }}
+
+  FunctionalTests:
+    name: Functional tests
+    runs-on: windows-latest
+    needs: deploy
+    steps:
+    - uses: actions/checkout@master
+
+    - name: Setup .NET Core
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Update web app url in Run Settings
+      shell: powershell
+      run: |
+          cd Tests\StaticWebsite.FunctionalTests
+          [xml]$runSetting = Get-Content functionalTests.runsettings
+          $runSetting.RunSettings.TestRunParameters.ChildNodes.Item(0).value = 'https://${{ env.APPNAME }}.azurewebsites.net/'
+          $runSetting.Save("$(pwd)/functionalTests.runsettings")
+
+    - name: Run tests
+      continue-on-error: false
+      run: |
+          cd Tests\StaticWebsite.FunctionalTests
+          dotnet test StaticWebsite.FunctionalTests.csproj -s functionalTests.runsettings
